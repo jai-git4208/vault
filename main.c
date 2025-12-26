@@ -9,6 +9,7 @@
 #define __STDC_WANT_LIB_EXT1__ 1
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/poll.h>
 #include <sys/resource.h>
 
 #define VAULT_FILE ".vault"
@@ -34,6 +35,45 @@
 void handle_errors() {
   ERR_print_errors_fp(stderr);
   abort();
+}
+
+int levenshtein(const char *s1, const char *s2) {
+  int len1 = strlen(s1), len2 = strlen(s2);
+  int matrix[len1 + 1][len2 + 1];
+
+  for (int i = 0; i <= len1; i++)
+    matrix[i][0] = i;
+  for (int j = 0; j <= len2; j++)
+    matrix[0][j] = j;
+
+  for (int i = 1; i <= len1; i++) {
+    for (int j = 1; j <= len2; j++) {
+      int cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
+      int min = matrix[i - 1][j] + 1;
+      if (matrix[i][j - 1] + 1 < min)
+        min = matrix[i][j - 1] + 1;
+      if (matrix[i - 1][j - 1] + cost < min)
+        min = matrix[i - 1][j - 1] + cost;
+      matrix[i][j] = min;
+    }
+  }
+  return matrix[len1][len2];
+}
+
+void copy_to_clipboard(const char *text) {
+  FILE *pipe = popen("pbcopy", "w");
+  if (pipe) {
+    fprintf(pipe, "%s", text);
+    pclose(pipe);
+  }
+}
+
+void clear_clipboard_after(int seconds) {
+  if (fork() == 0) {
+    sleep(seconds);
+    copy_to_clipboard("");
+    exit(0);
+  }
 }
 
 void secure_clear(void *ptr, size_t size) {
@@ -184,19 +224,18 @@ void save_encrypted_vault(const char *password, const char *decrypted_data,
   fwrite(ciphertext, 1, ciphertext_len, f);
   fclose(f);
 }
-//this function will disable echo and use termios to display stored password for security
+// this function will disable echo and use termios to display stored password
+// for security
 void secure_get_password(char *pass, size_t size) {
   struct termios oldt, newt;
   size_t i = 0;
   int c;
-
 
   if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
     perror("tcgetattr");
     exit(1);
   }
 
-  
   newt = oldt;
   newt.c_lflag &= ~(ECHO | ICANON);
   if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
@@ -204,12 +243,11 @@ void secure_get_password(char *pass, size_t size) {
     exit(1);
   }
 
-  
   while (i < size - 1) {
     c = getchar();
     if (c == '\n' || c == '\r' || c == EOF) {
       break;
-    } else if (c == 127 || c == '\b') { 
+    } else if (c == 127 || c == '\b') {
       if (i > 0) {
         i--;
       }
@@ -219,7 +257,7 @@ void secure_get_password(char *pass, size_t size) {
   }
   pass[i] = '\0';
 
-  //restore terminal settings
+  // restore terminal settings
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   printf("\n");
 }
@@ -233,11 +271,12 @@ void get_password(char *pass, size_t size) {
 int main(int argc, char *argv[]) {
   if (argc < 2) {
     printf(C_CYAN "Usage: " C_WHITE "vault " C_YELLOW
-                  "<init|add|list|get|delete>" C_RESET " [args]\n");
+                  "<init|add|list|get|delete|search|copy|interactive>" C_RESET
+                  " [args]\n");
     return 1;
   }
 
-  //disable core dumps
+  // disable core dumps
   struct rlimit limit;
   limit.rlim_cur = 0;
   limit.rlim_max = 0;
@@ -247,7 +286,7 @@ int main(int argc, char *argv[]) {
 
   char *command = argv[1];
 
-//lock password buffer in memory to prevent swapping
+  // lock password buffer in memory to prevent swapping
   char password[256];
   if (mlock(password, sizeof(password)) != 0) {
     fprintf(stderr,
@@ -371,6 +410,187 @@ int main(int argc, char *argv[]) {
              argv[2]);
     }
     free(new_data);
+  } else if (strcmp(command, "search") == 0) {
+    if (argc != 3) {
+      printf(C_CYAN "Usage: " C_WHITE "vault search " C_YELLOW "<query>" C_RESET
+                    "\n");
+      secure_clear(data, strlen(data));
+      free(data);
+      secure_clear(password, sizeof(password));
+      return 1;
+    }
+    printf(C_MAGENTA "Search results (fuzzy):" C_RESET "\n");
+    char *line = strtok(data, "\n");
+    int count = 0;
+    while (line) {
+      char s[256], u[256], p[256];
+      if (sscanf(line, "%s %s %s", s, u, p) == 3) {
+        int dist = levenshtein(argv[2], s);
+        if (dist <= 2 || strstr(s, argv[2])) {
+          printf(C_BLUE "  •" C_RESET " %s (match score: %d)\n", s, dist);
+          count++;
+        }
+        secure_clear(p, sizeof(p));
+      }
+      secure_clear(s, sizeof(s));
+      secure_clear(u, sizeof(u));
+      line = strtok(NULL, "\n");
+    }
+    if (count == 0)
+      printf(C_DIM "  No matches found." C_RESET "\n");
+  } else if (strcmp(command, "copy") == 0) {
+    if (argc != 3) {
+      printf(C_CYAN "Usage: " C_WHITE "vault copy " C_YELLOW "<service>" C_RESET
+                    "\n");
+      secure_clear(data, strlen(data));
+      free(data);
+      secure_clear(password, sizeof(password));
+      return 1;
+    }
+    char *line = strtok(data, "\n");
+    int found = 0;
+    while (line) {
+      char s[256], u[256], p[256];
+      if (sscanf(line, "%s %s %s", s, u, p) == 3 && strcmp(s, argv[2]) == 0) {
+        copy_to_clipboard(p);
+        printf(C_GREEN "✓ Password for %s copied to clipboard." C_RESET "\n",
+               s);
+        printf(C_DIM "  (Clipboard will clear in 15 seconds)" C_RESET "\n");
+        clear_clipboard_after(15);
+        found = 1;
+        secure_clear(p, sizeof(p));
+        secure_clear(s, sizeof(s));
+        secure_clear(u, sizeof(u));
+        break;
+      }
+      secure_clear(p, sizeof(p));
+      secure_clear(s, sizeof(s));
+      secure_clear(u, sizeof(u));
+      line = strtok(NULL, "\n");
+    }
+    if (!found)
+      printf(C_YELLOW "⚠ No entry found for " C_WHITE "%s" C_RESET "\n",
+             argv[2]);
+  } else if (strcmp(command, "interactive") == 0) {
+    printf(C_MAGENTA "Vault Interactive Mode (Timeout: 30s)" C_RESET "\n");
+    printf(C_DIM "Type 'exit' to close." C_RESET "\n");
+
+    struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
+    char buf[1024];
+
+    while (1) {
+      printf(C_CYAN "vault> " C_RESET);
+      fflush(stdout);
+
+      int ret = poll(&pfd, 1, 30000); // 30 seconds timeout
+      if (ret == 0) {
+        printf("\n" C_YELLOW
+               "⚠ Inactivity timeout. Auto-locking vault..." C_RESET "\n");
+        break;
+      } else if (ret < 0) {
+        perror("poll");
+        break;
+      }
+
+      if (fgets(buf, sizeof(buf), stdin) == NULL)
+        break;
+      buf[strcspn(buf, "\n")] = 0;
+
+      if (strcmp(buf, "exit") == 0 || strcmp(buf, "quit") == 0)
+        break;
+      if (strlen(buf) == 0)
+        continue;
+
+      // Handle interactive commands
+      char *i_argv[10];
+      int i_argc = 0;
+      char *token = strtok(buf, " ");
+      while (token && i_argc < 10) {
+        i_argv[i_argc++] = token;
+        token = strtok(NULL, " ");
+      }
+
+      if (i_argc == 0)
+        continue;
+      char *i_cmd = i_argv[0];
+
+      if (strcmp(i_cmd, "list") == 0) {
+        char *data_copy = strdup(data);
+        char *line = strtok(data_copy, "\n");
+        while (line) {
+          char s[256], u[256], p[256];
+          if (sscanf(line, "%s %s %s", s, u, p) == 3) {
+            printf(C_BLUE "  •" C_RESET " %s\n", s);
+            secure_clear(p, sizeof(p));
+          }
+          line = strtok(NULL, "\n");
+        }
+        free(data_copy);
+      } else if (strcmp(i_cmd, "get") == 0 && i_argc == 2) {
+        char *data_copy = strdup(data);
+        char *line = strtok(data_copy, "\n");
+        int found = 0;
+        while (line) {
+          char s[256], u[256], p[256];
+          if (sscanf(line, "%s %s %s", s, u, p) == 3 &&
+              strcmp(s, i_argv[1]) == 0) {
+            printf(C_CYAN "Service:  " C_WHITE "%s" C_RESET "\n", s);
+            printf(C_CYAN "Username: " C_WHITE "%s" C_RESET "\n", u);
+            printf(C_CYAN "Password: " C_GREEN "%s" C_RESET "\n", p);
+            found = 1;
+            secure_clear(p, sizeof(p));
+            break;
+          }
+          secure_clear(p, sizeof(p));
+          line = strtok(NULL, "\n");
+        }
+        if (!found)
+          printf(C_YELLOW "⚠ No entry found for %s" C_RESET "\n", i_argv[1]);
+        free(data_copy);
+      } else if (strcmp(i_cmd, "copy") == 0 && i_argc == 2) {
+        char *data_copy = strdup(data);
+        char *line = strtok(data_copy, "\n");
+        int found = 0;
+        while (line) {
+          char s[256], u[256], p[256];
+          if (sscanf(line, "%s %s %s", s, u, p) == 3 &&
+              strcmp(s, i_argv[1]) == 0) {
+            copy_to_clipboard(p);
+            printf(C_GREEN "✓ Password for %s copied to clipboard." C_RESET
+                           "\n",
+                   s);
+            printf(C_DIM "  (Clipboard will clear in 15 seconds)" C_RESET "\n");
+            clear_clipboard_after(15);
+            found = 1;
+            secure_clear(p, sizeof(p));
+            break;
+          }
+          secure_clear(p, sizeof(p));
+          line = strtok(NULL, "\n");
+        }
+        if (!found)
+          printf(C_YELLOW "⚠ No entry found for %s" C_RESET "\n", i_argv[1]);
+        free(data_copy);
+      } else if (strcmp(i_cmd, "search") == 0 && i_argc == 2) {
+        char *data_copy = strdup(data);
+        char *line = strtok(data_copy, "\n");
+        while (line) {
+          char s[256], u[256], p[256];
+          if (sscanf(line, "%s %s %s", s, u, p) == 3) {
+            int dist = levenshtein(i_argv[1], s);
+            if (dist <= 2 || strstr(s, i_argv[1])) {
+              printf(C_BLUE "  •" C_RESET " %s (match score: %d)\n", s, dist);
+            }
+            secure_clear(p, sizeof(p));
+          }
+          line = strtok(NULL, "\n");
+        }
+        free(data_copy);
+      } else {
+        printf(C_DIM "Unknown or malformed command. Supported: list, get "
+                     "<svc>, copy <svc>, search <svc>, exit" C_RESET "\n");
+      }
+    }
   } else {
     printf(C_RED "✗ Unknown command: " C_WHITE "%s" C_RESET "\n", command);
     secure_clear(data, strlen(data));
