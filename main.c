@@ -1,10 +1,10 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-#include <readpassphrase.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <termios.h>
 #include <unistd.h>
 #define __STDC_WANT_LIB_EXT1__ 1
 #include <string.h>
@@ -184,12 +184,50 @@ void save_encrypted_vault(const char *password, const char *decrypted_data,
   fwrite(ciphertext, 1, ciphertext_len, f);
   fclose(f);
 }
+//this function will disable echo and use termios to display stored password for security
+void secure_get_password(char *pass, size_t size) {
+  struct termios oldt, newt;
+  size_t i = 0;
+  int c;
 
-void get_password(char *pass, size_t size) {
-  if (!readpassphrase("Enter master password: ", pass, size, RPP_ECHO_OFF)) {
-    fprintf(stderr, "Error reading password\n");
+
+  if (tcgetattr(STDIN_FILENO, &oldt) != 0) {
+    perror("tcgetattr");
     exit(1);
   }
+
+  
+  newt = oldt;
+  newt.c_lflag &= ~(ECHO | ICANON);
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) != 0) {
+    perror("tcsetattr");
+    exit(1);
+  }
+
+  
+  while (i < size - 1) {
+    c = getchar();
+    if (c == '\n' || c == '\r' || c == EOF) {
+      break;
+    } else if (c == 127 || c == '\b') { 
+      if (i > 0) {
+        i--;
+      }
+    } else {
+      pass[i++] = c;
+    }
+  }
+  pass[i] = '\0';
+
+  //restore terminal settings
+  tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+  printf("\n");
+}
+
+void get_password(char *pass, size_t size) {
+  printf("Enter master password: ");
+  fflush(stdout);
+  secure_get_password(pass, size);
 }
 
 int main(int argc, char *argv[]) {
@@ -199,7 +237,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // 1. Disable core dumps
+  //disable core dumps
   struct rlimit limit;
   limit.rlim_cur = 0;
   limit.rlim_max = 0;
@@ -209,7 +247,7 @@ int main(int argc, char *argv[]) {
 
   char *command = argv[1];
 
-  // 2. Lock password buffer in memory to prevent swapping
+//lock password buffer in memory to prevent swapping
   char password[256];
   if (mlock(password, sizeof(password)) != 0) {
     fprintf(stderr,
@@ -253,7 +291,7 @@ int main(int argc, char *argv[]) {
     secure_clear(new_data, strlen(new_data));
     free(new_data);
   } else if (strcmp(command, "list") == 0) {
-    printf(C_MAGENTA "📦 Stored services:" C_RESET "\n");
+    printf(C_MAGENTA "Stored services:" C_RESET "\n");
     char *line = strtok(data, "\n");
     int count = 0;
     while (line) {
